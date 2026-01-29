@@ -113,7 +113,7 @@ func (om *realStatefulPodControlObjectManager) UpdateClaim(claim *v1.PersistentV
 
 func (spc *StatefulPodControl) CreateStatefulPod(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
 	// Create the Pod's PVCs prior to creating the Pod
-	if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
+	if err := spc.syncPersistentVolumeClaims(set, pod); err != nil {
 		spc.recordPodEvent("create", set, pod, err)
 		return err
 	}
@@ -147,18 +147,30 @@ func (spc *StatefulPodControl) UpdateStatefulPod(ctx context.Context, set *apps.
 		if !storageMatches(set, pod) {
 			updateStorage(set, pod)
 			consistent = false
-			if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
+			if err := spc.syncPersistentVolumeClaims(set, pod); err != nil {
 				spc.recordPodEvent("update", set, pod, err)
 				return err
 			}
 		}
 		// if the Pod's PVCs are not consistent with the StatefulSet's PVC deletion policy, update the PVC
 		// and dirty the pod.
-		if match, err := spc.ClaimsMatchRetentionPolicy(ctx, set, pod); err != nil {
+		if retentionMatch, err := spc.ClaimsMatchRetentionPolicy(ctx, set, pod); err != nil {
 			spc.recordPodEvent("update", set, pod, err)
 			return err
-		} else if !match {
+		} else if !retentionMatch {
 			if err := spc.UpdatePodClaimForRetentionPolicy(ctx, set, pod); err != nil {
+				spc.recordPodEvent("update", set, pod, err)
+				return err
+			}
+			consistent = false
+		}
+
+		if sizeMatch, err := spc.ClaimsMatchRequestedSize(ctx, set, pod); err != nil {
+			spc.recordPodEvent("update", set, pod, err)
+			return err
+		} else if !sizeMatch {
+			// PVCs do not match requested size, resize
+			if err := spc.syncPersistentVolumeClaims(set, pod); err != nil {
 				spc.recordPodEvent("update", set, pod, err)
 				return err
 			}
@@ -197,6 +209,41 @@ func (spc *StatefulPodControl) DeleteStatefulPod(set *apps.StatefulSet, pod *v1.
 	err := spc.objectMgr.DeletePod(pod)
 	spc.recordPodEvent("delete", set, pod, err)
 	return err
+}
+
+func (spc *StatefulPodControl) ClaimsMatchRequestedSize(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) (bool, error) {
+	logger := klog.FromContext(ctx)
+	ordinal := getOrdinal(pod)
+	templates := set.Spec.VolumeClaimTemplates
+
+	for i := range templates {
+		claimName := getPersistentVolumeClaimName(set, &templates[i], ordinal)
+		claim, err := spc.objectMgr.GetClaim(set.Namespace, claimName)
+
+		switch {
+		case apierrors.IsNotFound(err):
+			klog.FromContext(ctx).V(4).Info("Expected claim missing, continuing to pick up in next iteration", "PVC", klog.KObj(claim))
+		case err != nil:
+			return false, fmt.Errorf("Could not retrieve claim %s for %s when checking requested size", claimName, pod.Name)
+		default:
+			requestedSize, ok := templates[i].Spec.Resources.Requests[v1.ResourceStorage]
+			if !ok {
+				return false, fmt.Errorf("Could not find requested size for claim template %s in StatefulSet %s", templates[i].Name, set.Name)
+			}
+
+			claimSize, ok := claim.Spec.Resources.Requests[v1.ResourceStorage]
+			if !ok {
+				return false, fmt.Errorf("Could not find requested size for claim %s in StatefulSet %s", claim.Name, set.Name)
+			}
+
+			if claimSize.Cmp(requestedSize) < 0 {
+				logger.V(4).Info("PVC size is smaller than requested size", "PVC", klog.KObj(claim), "requestedSize", requestedSize.String(), "claimSize", claimSize.String())
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
 }
 
 // ClaimsMatchRetentionPolicy returns false if the PVCs for pod are not consistent with set's PVC deletion policy.
@@ -315,7 +362,7 @@ func (spc *StatefulPodControl) recordClaimEvent(verb string, set *apps.StatefulS
 
 // createMissingPersistentVolumeClaims creates all of the required PersistentVolumeClaims for pod, and updates its retention policy
 func (spc *StatefulPodControl) createMissingPersistentVolumeClaims(ctx context.Context, set *apps.StatefulSet, pod *v1.Pod) error {
-	if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
+	if err := spc.syncPersistentVolumeClaims(set, pod); err != nil {
 		return err
 	}
 	// Set PVC policy as much as is possible at this point.
@@ -326,11 +373,11 @@ func (spc *StatefulPodControl) createMissingPersistentVolumeClaims(ctx context.C
 	return nil
 }
 
-// createPersistentVolumeClaims creates all of the required PersistentVolumeClaims for pod, which must be a member of
+// syncPersistentVolumeClaims creates all of the required PersistentVolumeClaims for pod, which must be a member of
 // set. If all of the claims for Pod are successfully created, the returned error is nil. If creation fails, this method
 // may be called again until no error is returned, indicating the PersistentVolumeClaims for pod are consistent with
-// set's Spec.
-func (spc *StatefulPodControl) createPersistentVolumeClaims(set *apps.StatefulSet, pod *v1.Pod) error {
+// set's Spec. This method also handles upsizing of existing PVCs to match the StatefulSet's requested size.
+func (spc *StatefulPodControl) syncPersistentVolumeClaims(set *apps.StatefulSet, pod *v1.Pod) error {
 	var errs []error
 	for _, claim := range getPersistentVolumeClaims(set, pod) {
 		pvc, err := spc.objectMgr.GetClaim(claim.Namespace, claim.Name)
@@ -350,7 +397,32 @@ func (spc *StatefulPodControl) createPersistentVolumeClaims(set *apps.StatefulSe
 			if pvc.DeletionTimestamp != nil {
 				errs = append(errs, fmt.Errorf("pvc %s is being deleted", claim.Name))
 			}
+
+			// Check requested size matches StatefulSet spec, resize if necessary
+			requestedSize, ok := claim.Spec.Resources.Requests[v1.ResourceStorage]
+			if !ok {
+				errs = append(errs, fmt.Errorf("could not find requested size for claim template %s in StatefulSet %s", claim.Name, set.Name))
+				continue
+			}
+
+			actualSize, ok := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+			if !ok {
+				errs = append(errs, fmt.Errorf("could not find requested size for claim %s in StatefulSet %s", claim.Name, set.Name))
+				continue
+			}
+
+			if actualSize.Cmp(requestedSize) < 0 {
+				pvc = pvc.DeepCopy()
+				pvc.Spec.Resources.Requests[v1.ResourceStorage] = requestedSize
+				if err := spc.objectMgr.UpdateClaim(pvc); err != nil {
+					errs = append(errs, fmt.Errorf("could not resize claim %s from %s to %s: %w", claim.Name, actualSize.String(), requestedSize.String(), err))
+					spc.recordClaimEvent("update", set, pod, pvc, err)
+				} else {
+					spc.recordClaimEvent("update", set, pod, pvc, nil)
+				}
+			}
 		}
+
 		// TODO: Check resource requirements and accessmodes, update if necessary
 	}
 	return errorutils.NewAggregate(errs)

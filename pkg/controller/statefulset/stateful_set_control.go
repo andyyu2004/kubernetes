@@ -492,7 +492,12 @@ func (ssc *defaultStatefulSetControl) processReplica(ctx context.Context, set *a
 		retentionMatch = true
 	}
 
-	if identityMatches(set, replicas[i]) && storageMatches(set, replicas[i]) && retentionMatch {
+	sizeMatch, err := ssc.podControl.ClaimsMatchRequestedSize(ctx, updateSet, replicas[i])
+	if err != nil {
+		sizeMatch = true
+	}
+
+	if identityMatches(set, replicas[i]) && storageMatches(set, replicas[i]) && retentionMatch && sizeMatch {
 		return false, nil
 	}
 
