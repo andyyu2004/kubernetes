@@ -27,6 +27,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -793,5 +794,58 @@ func TestStatefulSetPodSubdomain(t *testing.T) {
 		if pod.Spec.Subdomain != serviceName {
 			t.Errorf("Pod %s has incorrect subdomain: got %s, want %s", pod.Name, pod.Spec.Subdomain, serviceName)
 		}
+	}
+}
+
+func TestStatefulSetPVCResize(t *testing.T) {
+	tCtx, closeFn, rm, informers, c := scSetup(t)
+	defer closeFn()
+	ns := framework.CreateNamespaceOrDie(c, "test-pvc-resize", t)
+	defer framework.DeleteNamespaceOrDie(c, ns, t)
+	cancel := runControllerAndInformers(tCtx, rm, informers)
+	defer cancel()
+
+	createHeadlessService(t, c, newHeadlessService(ns.Name))
+
+	sts := newSTS("sts", ns.Name, 2)
+	originalSize := resource.NewQuantity(1024*1024*1024, resource.BinarySI)
+	newSize := resource.NewQuantity(2*1024*1024*1024, resource.BinarySI)
+	sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[v1.ResourceStorage] = *originalSize
+
+	stss, _ := createSTSsPods(t, c, []*appsv1.StatefulSet{sts}, []*v1.Pod{})
+	sts = stss[0]
+	waitSTSStable(t, c, sts)
+
+	pvcClient := c.CoreV1().PersistentVolumeClaims(ns.Name)
+	pvcs := getStatefulSetPVCs(t, pvcClient, sts)
+	for _, pvc := range pvcs {
+		size := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+		if size.Cmp(*originalSize) != 0 {
+			t.Errorf("Initial PVC %s size = %v, want %v", pvc.Name, size.String(), originalSize.String())
+		}
+	}
+
+	stsClient := c.AppsV1().StatefulSets(ns.Name)
+	updatedSts := updateSTS(t, stsClient, sts.Name, func(sts *appsv1.StatefulSet) {
+		sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[v1.ResourceStorage] = *newSize
+	})
+
+	if err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
+		pvcs := getStatefulSetPVCs(t, pvcClient, updatedSts)
+		expected := newSize
+		for _, pvc := range pvcs {
+			size := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+			if size.Cmp(*expected) != 0 {
+				return false, nil
+			}
+		}
+		return true, nil
+	}); err != nil {
+		pvcs := getStatefulSetPVCs(t, pvcClient, updatedSts)
+		for _, pvc := range pvcs {
+			size := pvc.Spec.Resources.Requests[v1.ResourceStorage]
+			t.Logf("PVC %s current size: %v", pvc.Name, size.String())
+		}
+		t.Fatalf("Failed to verify PVCs resized to 2Gi: %v", err)
 	}
 }
