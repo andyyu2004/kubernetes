@@ -169,7 +169,6 @@ func (spc *StatefulPodControl) UpdateStatefulPod(ctx context.Context, set *apps.
 			spc.recordPodEvent("update", set, pod, err)
 			return err
 		} else if !sizeMatch {
-			// PVCs do not match requested size, resize
 			if err := spc.syncPersistentVolumeClaims(set, pod); err != nil {
 				spc.recordPodEvent("update", set, pod, err)
 				return err

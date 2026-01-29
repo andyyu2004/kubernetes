@@ -27,6 +27,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -807,10 +808,23 @@ func TestStatefulSetPVCResize(t *testing.T) {
 
 	createHeadlessService(t, c, newHeadlessService(ns.Name))
 
+	scName := "resizable-sc"
+	sc := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: scName,
+		},
+		Provisioner:          "kubernetes.io/fake-provisioner",
+		AllowVolumeExpansion: ptr.To(true),
+	}
+	if _, err := c.StorageV1().StorageClasses().Create(context.TODO(), sc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create StorageClass: %v", err)
+	}
+
 	sts := newSTS("sts", ns.Name, 2)
 	originalSize := resource.NewQuantity(1024*1024*1024, resource.BinarySI)
 	newSize := resource.NewQuantity(2*1024*1024*1024, resource.BinarySI)
 	sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[v1.ResourceStorage] = *originalSize
+	sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = &scName
 
 	stss, _ := createSTSsPods(t, c, []*appsv1.StatefulSet{sts}, []*v1.Pod{})
 	sts = stss[0]
@@ -837,10 +851,9 @@ func TestStatefulSetPVCResize(t *testing.T) {
 
 	if err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
 		pvcs := getStatefulSetPVCs(t, pvcClient, updatedSts)
-		expected := newSize
 		for _, pvc := range pvcs {
 			size := pvc.Spec.Resources.Requests[v1.ResourceStorage]
-			if size.Cmp(*expected) != 0 {
+			if size.Cmp(*newSize) != 0 {
 				return false, nil
 			}
 		}
