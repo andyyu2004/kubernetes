@@ -823,6 +823,11 @@ func TestStatefulSetPVCResize(t *testing.T) {
 		if size.Cmp(*originalSize) != 0 {
 			t.Errorf("Initial PVC %s size = %v, want %v", pvc.Name, size.String(), originalSize.String())
 		}
+
+		pvc.Status.Phase = v1.ClaimBound
+		if _, err := pvcClient.UpdateStatus(context.TODO(), pvc, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("Failed to set PVC %s to Bound: %v", pvc.Name, err)
+		}
 	}
 
 	stsClient := c.AppsV1().StatefulSets(ns.Name)
