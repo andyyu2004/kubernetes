@@ -1114,6 +1114,9 @@ func TestValidateStatefulSetUpdate(t *testing.T) {
 	validPVCTemplateChangedSize := *validPVCTemplate.DeepCopy()
 	validPVCTemplateChangedSize.Spec.Resources.Requests[api.ResourceStorage] = resource.MustParse("2Gi")
 
+	validPVCTemplateDecreasedSize := *validPVCTemplate.DeepCopy()
+	validPVCTemplateDecreasedSize.Spec.Resources.Requests[api.ResourceStorage] = resource.MustParse("500Mi")
+
 	validPVCTemplateChangedClass := *validPVCTemplate.DeepCopy()
 	validPVCTemplateChangedClass.Spec.StorageClassName = &storageClass2
 
@@ -1237,6 +1240,10 @@ func TestValidateStatefulSetUpdate(t *testing.T) {
 		name:   "invalid old spec (missing volume accessModes) should skip validation",
 		old:    mkStatefulSet(&validPodTemplate, tweakPVCTemplate(invalidPVCTemplate)),
 		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(invalidPVCTemplate), tweakReplicas(3)),
+	}, {
+		name:   "increase pvc template storage size",
+		old:    mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplate)),
+		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplateChangedSize)),
 	},
 	}
 
@@ -1285,25 +1292,25 @@ func TestValidateStatefulSetUpdate(t *testing.T) {
 			field.Invalid(field.NewPath("spec", "replicas"), nil, ""),
 		},
 	}, {
-		name:   "update pvc template size",
+		name:   "decrease pvc template storage size",
 		old:    mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplate)),
-		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplateChangedSize)),
+		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplateDecreasedSize)),
 		errs: field.ErrorList{
-			field.Forbidden(field.NewPath("spec"), ""),
+			field.Forbidden(field.NewPath("spec", "volumeClaimTemplates").Index(0).Child("spec", "resources", "requests", "storage"), ""),
 		},
 	}, {
 		name:   "update pvc template storage class",
 		old:    mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplate)),
 		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplateChangedClass)),
 		errs: field.ErrorList{
-			field.Forbidden(field.NewPath("spec"), ""),
+			field.Forbidden(field.NewPath("spec", "volumeClaimTemplates").Index(0).Child("spec"), ""),
 		},
 	}, {
 		name:   "add new pvc template",
 		old:    mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplate)),
 		update: mkStatefulSet(&validPodTemplate, tweakPVCTemplate(validPVCTemplate, validPVCTemplate2)),
 		errs: field.ErrorList{
-			field.Forbidden(field.NewPath("spec"), ""),
+			field.Forbidden(field.NewPath("spec", "volumeClaimTemplates"), ""),
 		},
 	}, {
 		name:   "valid old spec but invalid new spec",

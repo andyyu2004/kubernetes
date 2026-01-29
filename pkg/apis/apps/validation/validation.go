@@ -123,6 +123,56 @@ func validateVolumeClaimTemplates(volumeClaimTemplates []api.PersistentVolumeCla
 	return allErrs
 }
 
+func validateVolumeClaimTemplatesUpdate(newTemplates, oldTemplates []api.PersistentVolumeClaim, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	if len(newTemplates) != len(oldTemplates) {
+		allErrs = append(allErrs, field.Forbidden(fldPath, "volumeClaimTemplates cannot be added or removed"))
+		return allErrs
+	}
+
+	oldByName := make(map[string]api.PersistentVolumeClaim, len(oldTemplates))
+	for _, tmpl := range oldTemplates {
+		oldByName[tmpl.Name] = tmpl
+	}
+
+	for i := range newTemplates {
+		newTmpl := &newTemplates[i]
+		oldTmpl, found := oldByName[newTmpl.Name]
+		if !found {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Index(i).Child("metadata", "name"),
+				"volumeClaimTemplate name cannot be changed"))
+			continue
+		}
+
+		newClone := newTmpl.DeepCopy()
+		oldClone := oldTmpl.DeepCopy()
+
+		// Normalize resource requests for comparison below
+		if newClone.Spec.Resources.Requests != nil && oldClone.Spec.Resources.Requests != nil {
+			oldStorage := oldClone.Spec.Resources.Requests[api.ResourceStorage]
+			newClone.Spec.Resources.Requests[api.ResourceStorage] = oldStorage // +k8s:verify-mutation:reason=clone
+		}
+
+		// Everything else must be identical
+		if !apiequality.Semantic.DeepEqual(newClone.Spec, oldClone.Spec) {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Index(i).Child("spec"),
+				"volumeClaimTemplate spec is immutable except storage size"))
+			continue
+		}
+
+		// Validate storage size change (must not decrease)
+		oldStorage := oldTmpl.Spec.Resources.Requests[api.ResourceStorage]
+		newStorage := newTmpl.Spec.Resources.Requests[api.ResourceStorage]
+		if newStorage.Cmp(oldStorage) < 0 {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Index(i).Child("spec", "resources", "requests", "storage"),
+				"storage requests may only be increased"))
+		}
+	}
+
+	return allErrs
+}
+
 // ValidateStatefulSetSpec tests if required fields in the StatefulSet spec are set.
 func ValidateStatefulSetSpec(spec *apps.StatefulSetSpec, fldPath *field.Path, opts apivalidation.PodValidationOptions, setOpts StatefulSetValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
@@ -253,6 +303,12 @@ func ValidateStatefulSetUpdate(statefulSet, oldStatefulSet *apps.StatefulSet, op
 	}
 	allErrs = append(allErrs, ValidateStatefulSetSpec(&statefulSet.Spec, field.NewPath("spec"), opts, setOpts)...)
 
+	// Validate volumeClaimTemplates update separately (allows storage size increases only)
+	allErrs = append(allErrs, validateVolumeClaimTemplatesUpdate(
+		statefulSet.Spec.VolumeClaimTemplates,
+		oldStatefulSet.Spec.VolumeClaimTemplates,
+		field.NewPath("spec", "volumeClaimTemplates"))...)
+
 	// statefulset updates aren't super common and general updates are likely to be touching spec, so we'll do this
 	// deep copy right away.  This avoids mutating our inputs
 	newStatefulSetClone := statefulSet.DeepCopy()
@@ -264,8 +320,9 @@ func ValidateStatefulSetUpdate(statefulSet, oldStatefulSet *apps.StatefulSet, op
 	newStatefulSetClone.Spec.RevisionHistoryLimit = oldStatefulSet.Spec.RevisionHistoryLimit // +k8s:verify-mutation:reason=clone
 
 	newStatefulSetClone.Spec.PersistentVolumeClaimRetentionPolicy = oldStatefulSet.Spec.PersistentVolumeClaimRetentionPolicy // +k8s:verify-mutation:reason=clone
+	newStatefulSetClone.Spec.VolumeClaimTemplates = oldStatefulSet.Spec.VolumeClaimTemplates                                   // +k8s:verify-mutation:reason=clone
 	if !apiequality.Semantic.DeepEqual(newStatefulSetClone.Spec, oldStatefulSet.Spec) {
-		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'revisionHistoryLimit', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden"))
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'revisionHistoryLimit', 'persistentVolumeClaimRetentionPolicy', 'minReadySeconds' and 'volumeClaimTemplates' are forbidden"))
 	}
 
 	return allErrs
